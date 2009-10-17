@@ -127,6 +127,8 @@ typedef struct RequestStats
 
 #define STATS_BUCKET_COUNT 1024*8
 
+static RequestStats **collectStats(jvmtiEnv *jvmti, JNIEnv *env);
+static void freeStats(RequestStats **stats);
 
 /* Enter a critical section by doing a JVMTI Raw Monitor Enter */
 static void
@@ -195,43 +197,64 @@ HEAP_TRACKER_native_newarr(JNIEnv *env, jclass klass, jthread thread, jobject a)
     tagObject(gdata->jvmti, a, thread);
 }
 
-static void HEAP_TRACKER_native_extract_stats(JNIEnv *env, jclass statsClass, jobject list)
+static void HEAP_TRACKER_native_extract_stats(JNIEnv *env, jclass klass, jclass statsClass, jobject list)
 {
+  RequestStats ** stats_buckets;
   jmethodID add_methodID;  
   jmethodID constructor_methodID;
   jclass listClass;
   jobject newStatsObject;
-  RequestStats static_stats;
-  RequestStats *stats;
   int i;
+  jvmtiEnv *jvmti = gdata->jvmti;
+  jvmtiError error;
+
+  /* Force garbage collection now so we get our ObjectFree calls */
+  error = (*jvmti)->ForceGarbageCollection(jvmti);
+  check_jvmti_error(jvmti, error, "Cannot force garbage collection");
+
+  enterCriticalSection(jvmti); {
+      stats_buckets = collectStats(jvmti, env);
+  } exitCriticalSection(jvmti);
 
   listClass = (*env)->GetObjectClass(env, list);
-
-  constructor_methodID = (*env)->GetMethodID(env, statsClass, "<init>", "()V");
-  add_methodID = (*env)->GetMethodID(env, listClass, "add", "(Ljava/lang/Object;)Z");
-  
-  stats = &static_stats;
-  stats->requestId = 1;
-  stats->objectCount = 2;
-  stats->memoryUsed = 3;
-  stats->arrayCount = 4;
-
-  for(i=0;i<4;i++)
-  {  
-    // construct new stats object
-    newStatsObject = (*env)->NewObject(env, statsClass, constructor_methodID, stats->requestId, stats->objectCount, stats->memoryUsed, stats->arrayCount);
+  if(listClass == NULL)
+    return;
     
-    // append it to list
-    (*env)->CallVoidMethod(env, list, add_methodID, newStatsObject);
-  }
+  constructor_methodID = (*env)->GetMethodID(env, statsClass, "<init>", "(IIII)V");
+  if(constructor_methodID == NULL)
+    return;
+  
+  add_methodID = (*env)->GetMethodID(env, listClass, "add", "(Ljava/lang/Object;)Z");
+  if(add_methodID == NULL)
+    return;
+
+    /* walk through collected stats objects */    
+    for(i=0;i<STATS_BUCKET_COUNT;i++) 
+    {
+      RequestStats *stats;
+      
+      stats = stats_buckets[i];
+      while(stats != NULL) {
+        // construct new stats object
+        newStatsObject = (*env)->NewObject(env, statsClass, constructor_methodID, stats->requestId, stats->objectCount, stats->memoryUsed, stats->arrayCount);
+        
+        // append it to list
+        (*env)->CallVoidMethod(env, list, add_methodID, newStatsObject);
+
+        stats = stats->next;
+      }
+    }
+
+    freeStats(stats_buckets);
 }
 
-static void HEAP_TRACKER_native_start_request(JNIEnv *env, jthread thread, jint requestId)
+static void HEAP_TRACKER_native_start_request(JNIEnv *env, jclass klass, jthread thread, jint requestId)
 {
     ThreadAgentData *threadData;
     jvmtiError error;
 
-    stdout_message("start request called");
+    fprintf(stdout, "start request called: %d\n", requestId);
+    fflush(stdout);
 
     thread_local_requestId = requestId;
 }
@@ -263,7 +286,7 @@ cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
             fatal_error("ERROR: JNI: Cannot find %s with FindClass\n", 
                         STRING(HEAP_TRACKER_class));
         }
-        rc = (*env)->RegisterNatives(env, klass, registry, 3);
+        rc = (*env)->RegisterNatives(env, klass, registry, 4);
         if ( rc != 0 ) {
             fatal_error("ERROR: JNI: Cannot register natives for class %s\n", 
                         STRING(HEAP_TRACKER_class));
@@ -374,6 +397,45 @@ cbObjectSpaceCounter(jlong class_tag, jlong size, jlong* tag_ptr, jint length,
   return JVMTI_VISIT_OBJECTS;
 }
 
+static RequestStats **collectStats(jvmtiEnv *jvmti, JNIEnv *env)
+{
+    jvmtiHeapCallbacks heapCallbacks;
+    jvmtiEventCallbacks callbacks;
+    RequestStats **stats_buckets;
+    jvmtiError error;
+
+    stats_buckets  = (RequestStats **)calloc(STATS_BUCKET_COUNT, sizeof( RequestStats * )); 
+    
+    /* Iterate through heap and find all objects */
+    (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
+    heapCallbacks.heap_iteration_callback = &cbObjectSpaceCounter;
+    error = (*jvmti)->IterateThroughHeap(jvmti, 0, NULL, &heapCallbacks, stats_buckets);
+    check_jvmti_error(jvmti, error, "Cannot iterate through heap");
+    
+    return stats_buckets;
+}
+
+
+static void freeStats(RequestStats **stats_buckets)
+{
+  int i;
+  
+    /* walk through collected stats objects */    
+    for(i=0;i<STATS_BUCKET_COUNT;i++) 
+    {
+      RequestStats *stats;
+      
+      stats = stats_buckets[i];
+      while(stats != NULL) {
+        free(stats);
+        stats = stats->next;
+      }
+    }
+    
+    free(stats_buckets);
+}
+
+
 /* Callback for JVMTI_EVENT_VM_DEATH */
 static void JNICALL
 cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
@@ -393,33 +455,6 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
         jclass              klass;
         jfieldID            field;
         jvmtiEventCallbacks callbacks;
-        RequestStats **stats_buckets;
-        int i;
-
-    /* walk heap and collect stats on what objects remain */
-
-    stats_buckets  = (RequestStats **)calloc(STATS_BUCKET_COUNT, sizeof( RequestStats * )); 
-    
-    /* Iterate through heap and find all objects */
-    (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
-    heapCallbacks.heap_iteration_callback = &cbObjectSpaceCounter;
-    error = (*jvmti)->IterateThroughHeap(jvmti, 0, NULL, &heapCallbacks, stats_buckets);
-    check_jvmti_error(jvmti, error, "Cannot iterate through heap");
-
-    /* walk through collected stats objects and print them out */    
-    for(i=0;i<STATS_BUCKET_COUNT;i++) 
-    {
-      RequestStats *stats;
-      
-      stats = stats_buckets[i];
-      while(stats != NULL) {
-        fprintf(stdout, "request %d, objectCount %d, memoryUsed %d, arrayCount %d\n", stats->requestId, stats->objectCount, stats->memoryUsed, stats->arrayCount);
-        stats = stats->next;
-      }
-    }
-    
-    free(stats_buckets);
-
 
         /* Disengage calls in HEAP_TRACKER_class. */
         klass = (*env)->FindClass(env, STRING(HEAP_TRACKER_class));

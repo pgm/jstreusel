@@ -19,6 +19,6 @@ public class TestHeapTracking {
 			System.out.println("request "+stat.requestId+", objectCount: "+stat.objectCount+", memoryCount: "+stat.memoryCount+", arrayCount: "+stat.arrayCount);
 		}
 		
-		System.out.println("stuff "+data.length+data2.length);
+		System.out.println("finished test.  (Ignore rest of line: "+data.length+data2.length+")");
 	}
 }
