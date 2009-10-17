@@ -74,13 +74,14 @@
  * 
  */
 
-#define HEAP_TRACKER_class           HeapTracker /* Name of class we are using */
+#define HEAP_TRACKER_class           HeapTrackerJNISupport /* Name of class we are using */
 #define HEAP_TRACKER_newobj        newobj   /* Name of java init method */
 #define HEAP_TRACKER_newarr        newarr   /* Name of java newarray method */
 #define HEAP_TRACKER_native_newobj _newobj  /* Name of java newobj native */
 #define HEAP_TRACKER_native_newarr _newarr  /* Name of java newarray native */
 #define HEAP_TRACKER_engaged       engaged  /* Name of static field switch */
 #define HEAP_TRACKER_native_start_request _start_request /* Name of java start_request native */
+#define HEAP_TRACKER_native_extract_stats _extract_stats /* Name of java start_request native */
 
 /* C macros to create strings from tokens */
 #define _STRING(s) #s
@@ -114,6 +115,18 @@ typedef struct {
 static GlobalAgentData *gdata;
 
 __thread int thread_local_requestId = 0;
+
+typedef struct RequestStats
+{
+  int requestId;
+  int objectCount;
+  int memoryUsed;
+  int arrayCount;
+  struct RequestStats *next;
+} RequestStats;
+
+#define STATS_BUCKET_COUNT 1024*8
+
 
 /* Enter a critical section by doing a JVMTI Raw Monitor Enter */
 static void
@@ -182,26 +195,41 @@ HEAP_TRACKER_native_newarr(JNIEnv *env, jclass klass, jthread thread, jobject a)
     tagObject(gdata->jvmti, a, thread);
 }
 
+static void HEAP_TRACKER_native_extract_stats(JNIEnv *env, jclass statsClass, jobject list)
+{
+  jmethodID add_methodID;  
+  jmethodID constructor_methodID;
+  jclass listClass;
+  jobject newStatsObject;
+  RequestStats static_stats;
+  RequestStats *stats;
+  int i;
+
+  listClass = (*env)->GetObjectClass(env, list);
+
+  constructor_methodID = (*env)->GetMethodID(env, statsClass, "<init>", "()V");
+  add_methodID = (*env)->GetMethodID(env, listClass, "add", "(Ljava/lang/Object;)Z");
+  
+  stats = &static_stats;
+  stats->requestId = 1;
+  stats->objectCount = 2;
+  stats->memoryUsed = 3;
+  stats->arrayCount = 4;
+
+  for(i=0;i<4;i++)
+  {  
+    // construct new stats object
+    newStatsObject = (*env)->NewObject(env, statsClass, constructor_methodID, stats->requestId, stats->objectCount, stats->memoryUsed, stats->arrayCount);
+    
+    // append it to list
+    (*env)->CallVoidMethod(env, list, add_methodID, newStatsObject);
+  }
+}
 
 static void HEAP_TRACKER_native_start_request(JNIEnv *env, jthread thread, jint requestId)
 {
     ThreadAgentData *threadData;
     jvmtiError error;
-
-/*
-    error = (*jvmti)->GetThreadLocalStorage(jvmti, thread, (void**)&threadData);
-    
-    if( threadData != NULL ) 
-    {
-      threadData->requestId = requestId;
-    }
-    else
-    {
-      threadData = (ThreadAgentData*)calloc(1, sizeof(ThreadAgentData));
-      error = (*jvmti)->SetThreadLocalStorage(jvmti, thread, threadData);
-      check_jvmti_error(jvmti, error, "Cannot get thread local storage");
-    }  
-    */
 
     stdout_message("start request called");
 
@@ -218,11 +246,15 @@ cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
         jint rc;
 
         /* Java Native Methods for class */
-        static JNINativeMethod registry[2] = {
+        static JNINativeMethod registry[4] = {
             {STRING(HEAP_TRACKER_native_newobj), "(Ljava/lang/Object;Ljava/lang/Object;)V", 
                 (void*)&HEAP_TRACKER_native_newobj},
             {STRING(HEAP_TRACKER_native_newarr), "(Ljava/lang/Object;Ljava/lang/Object;)V", 
-                (void*)&HEAP_TRACKER_native_newarr}
+                (void*)&HEAP_TRACKER_native_newarr},
+            {STRING(HEAP_TRACKER_native_start_request), "(Ljava/lang/Object;I)V", 
+                (void*)&HEAP_TRACKER_native_start_request},
+            {STRING(HEAP_TRACKER_native_extract_stats), "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                (void*)&HEAP_TRACKER_native_extract_stats}
         };
         
         /* Register Natives for class whose methods we use */
@@ -231,7 +263,7 @@ cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
             fatal_error("ERROR: JNI: Cannot find %s with FindClass\n", 
                         STRING(HEAP_TRACKER_class));
         }
-        rc = (*env)->RegisterNatives(env, klass, registry, 2);
+        rc = (*env)->RegisterNatives(env, klass, registry, 3);
         if ( rc != 0 ) {
             fatal_error("ERROR: JNI: Cannot register natives for class %s\n", 
                         STRING(HEAP_TRACKER_class));
@@ -281,16 +313,6 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
     } exitCriticalSection(jvmti);
 }
 
-typedef struct RequestStats
-{
-  int requestId;
-  int objectCount;
-  int memoryUsed;
-  int arrayCount;
-  struct RequestStats *next;
-} RequestStats;
-
-#define STATS_BUCKET_COUNT 1024*8
 
 RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
 {
@@ -298,15 +320,20 @@ RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
   int hash;
 
   hash = needle % STATS_BUCKET_COUNT;
+//  if(buckets == NULL) {
+//    stdout_message("!!! NULL");
+//  }
+  
   stats = buckets[hash];
-  do {
+  while(stats != NULL)
+  {
     if(stats->requestId == needle) 
     {
       return stats;
     }
  
     stats = stats->next;
-  } while(stats != NULL);
+  }
   
   // if we reach here, allocate a new stats object
   stats = (RequestStats*)calloc(1, sizeof(RequestStats));
@@ -314,7 +341,7 @@ RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
   
   // and append it to the chain in the appropriate bucket
   stats->next = buckets[hash];
-  buckets[hash] = buckets[hash];
+  buckets[hash] = stats;
   
   return stats;
 }
@@ -386,7 +413,7 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
       
       stats = stats_buckets[i];
       while(stats != NULL) {
-        fprintf(stdout, "request %d, objectCount %d, memoryUsed %d, arrayCount %d\n", stats->requestId, stats->objectCount, stats->arrayCount);
+        fprintf(stdout, "request %d, objectCount %d, memoryUsed %d, arrayCount %d\n", stats->requestId, stats->objectCount, stats->memoryUsed, stats->arrayCount);
         stats = stats->next;
       }
     }

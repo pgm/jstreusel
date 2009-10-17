@@ -39,46 +39,31 @@
  *    injections of all class files.
  */
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.List;
+import java.util.ArrayList;
 
-public class HeapTracker {
-
-    private static AtomicInteger uniqueId;
-    private static int engaged = 0; 
+public class HeapTracker implements IHeapTracker {
+  private AtomicInteger uniqueId = new AtomicInteger(1);
   
-    private static native void _newobj(Object thread, Object o);
-    private static native void _start_request(Object thread, int requestId); 
-    private static native void _newarr(Object thread, Object a);
-
-    public static void initialize()
-    {
-      uniqueId = new AtomicInteger(1);
-    }
-    
-    public static void newobj(Object o)
-    {
-	if ( engaged != 0 ) {
-	    _newobj(Thread.currentThread(), o);
-	}
-    }
-    
-    public static void newarr(Object a)
-    {
-	if ( engaged != 0 ) {
-	    _newarr(Thread.currentThread(), a);
-	}
-    }
-
-  public static void startRequest()
+  public int startRequest()
   {
-    if(uniqueId == null)
-      initialize();
     int id = uniqueId.getAndIncrement();
-    _start_request(Thread.currentThread(), id);
+
+    HeapTrackerJNISupport._start_request(Thread.currentThread(), id);
+
+    return id;
   }
 
-  public static void endRequest()
+  public void endRequest()
   {
-    _start_request(Thread.currentThread(), 0);
+    HeapTrackerJNISupport._start_request(Thread.currentThread(), 0);
+  }
+  
+  public List<RequestStats> getRequestStats()
+  {
+    List<RequestStats> stats = new ArrayList<RequestStats>();
+    HeapTrackerJNISupport._extract_stats(RequestStats.class, stats);
+    return stats;
   }
 }
 

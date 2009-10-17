@@ -49,7 +49,7 @@
 # Source lists
 LIBNAME=heapTracker
 SOURCES=heapTracker.c ../agent_util/agent_util.c
-JAVA_SOURCES=HeapTracker.java
+JAVA_SOURCES=HeapTracker.java TestHeapTracking.java
 
 # Name of jar file that needs to be created
 JARFILE=heapTracker.jar
@@ -158,7 +158,8 @@ clean:
 
 # Simple tester
 test: all
-	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) -version
+	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) TestHeapTracking
+#	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) -version
 
 # Compilation rule only needed on Windows
 ifeq ($(OSNAME), win32)
