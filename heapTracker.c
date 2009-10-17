@@ -80,6 +80,7 @@
 #define HEAP_TRACKER_native_newobj _newobj  /* Name of java newobj native */
 #define HEAP_TRACKER_native_newarr _newarr  /* Name of java newarray native */
 #define HEAP_TRACKER_engaged       engaged  /* Name of static field switch */
+#define HEAP_TRACKER_native_start_request _start_request /* Name of java start_request native */
 
 /* C macros to create strings from tokens */
 #define _STRING(s) #s
@@ -87,82 +88,32 @@
 
 /* ------------------------------------------------------------------- */
 
-/* Flavors of traces (to separate out stack traces) */
-
-typedef enum { 
-    TRACE_FIRST                        = 0,
-    TRACE_USER                        = 0, 
-    TRACE_BEFORE_VM_START        = 1, 
-    TRACE_BEFORE_VM_INIT        = 2, 
-    TRACE_VM_OBJECT                = 3,
-    TRACE_MYSTERY                = 4,
-    TRACE_LAST                        = 4 
-} TraceFlavor;
-
-static char * flavorDesc[] = {
-    "",
-    "before VM_START",
-    "before VM_INIT",
-    "VM_OBJECT",
-    "unknown"
-};
-
-/* Trace (Stack Trace) */
-
-#define MAX_FRAMES 6
-typedef struct Trace {
-    /* Number of frames (includes HEAP_TRACKER methods) */
-    jint           nframes;
-    /* Frames from GetStackTrace() (2 extra for HEAP_TRACKER methods) */
-    jvmtiFrameInfo frames[MAX_FRAMES+2];
-    /* Used to make some traces unique */
-    TraceFlavor    flavor;
-} Trace;
-
-/* Trace information (more than one object will have this as a tag) */
-
-typedef struct TraceInfo {
-    /* Trace where this object was allocated from */
-    Trace             trace;
-    /* 64 bit hash code that attempts to identify this specific trace */
-    jlong             hashCode;
-    /* Total space taken up by objects allocated from this trace */
-    jlong             totalSpace;
-    /* Total count of objects ever allocated from this trace */
-    int               totalCount;
-    /* Total live objects that were allocated from this trace */
-    int               useCount;
-    /* The next TraceInfo in the hash bucket chain */
-    struct TraceInfo *next;
-} TraceInfo;
-
 /* Global agent data structure */
 
 typedef struct {
     /* JVMTI Environment */
     jvmtiEnv      *jvmti;
+
     /* State of the VM flags */
     jboolean       vmStarted;
     jboolean       vmInitialized;
     jboolean       vmDead;
-    /* Options */
-    int            maxDump;
+
     /* Data access Lock */
     jrawMonitorID  lock;
+
     /* Counter on classes where BCI has been applied */
     jint           ccount;
-    /* Hash table to lookup TraceInfo's via Trace's */
-    #define HASH_INDEX_BIT_WIDTH 12 /* 4096 */
-    #define HASH_BUCKET_COUNT (1<<HASH_INDEX_BIT_WIDTH)
-    #define HASH_INDEX_MASK (HASH_BUCKET_COUNT-1)
-    TraceInfo     *hashBuckets[HASH_BUCKET_COUNT];
-    /* Count of TraceInfo's allocated */
-    int            traceInfoCount;
-    /* Pre-defined traces for the system and mystery situations */
-    TraceInfo     *emptyTrace[TRACE_LAST+1];
 } GlobalAgentData;
 
+/* per-thread state */
+typedef struct {
+  jlong requestId;
+} ThreadAgentData;
+
 static GlobalAgentData *gdata;
+
+__thread int thread_local_requestId = 0;
 
 /* Enter a critical section by doing a JVMTI Raw Monitor Enter */
 static void
@@ -184,191 +135,77 @@ exitCriticalSection(jvmtiEnv *jvmti)
     check_jvmti_error(jvmti, error, "Cannot exit with raw monitor");
 }
 
-/* Update stats on a TraceInfo */
-static TraceInfo *
-updateStats(TraceInfo *tinfo)
-{
-    tinfo->totalCount++;
-    tinfo->useCount++;
-    return tinfo;
-}
-
-/* Get TraceInfo for empty stack */
-static TraceInfo *
-emptyTrace(TraceFlavor flavor)
-{
-    return updateStats(gdata->emptyTrace[flavor]);
-}
-
-/* Allocate new TraceInfo */
-static TraceInfo *
-newTraceInfo(Trace *trace, jlong hashCode, TraceFlavor flavor)
-{
-    TraceInfo *tinfo;
-    
-    tinfo = (TraceInfo*)calloc(1, sizeof(TraceInfo));
-    if ( tinfo == NULL ) {
-        fatal_error("ERROR: Ran out of malloc() space\n");
-    } else {
-        int hashIndex;
-
-        tinfo->trace = *trace;
-        tinfo->trace.flavor = flavor;
-        tinfo->hashCode = hashCode;
-        gdata->traceInfoCount++;
-        hashIndex = (int)(hashCode & HASH_INDEX_MASK);
-        tinfo->next = gdata->hashBuckets[hashIndex];
-        gdata->hashBuckets[hashIndex] = tinfo;
-    }
-    return tinfo;
-}
-
-/* Create hash code for a Trace */
-static jlong
-hashTrace(Trace *trace)
-{
-    jlong hashCode;
-    int   i;
-    
-    hashCode = 0;
-    for ( i = 0 ; i < trace->nframes ; i++ ) {
-        hashCode = (hashCode << 3) + 
-                (jlong)(ptrdiff_t)(void*)(trace->frames[i].method);
-        hashCode = (hashCode << 2) + 
-                (jlong)(trace->frames[i].location);
-    }
-    hashCode = (hashCode << 3) + trace->nframes;
-    hashCode += trace->flavor;
-    return hashCode;
-}
-
-/* Lookup or create a new TraceInfo */
-static TraceInfo *
-lookupOrEnter(jvmtiEnv *jvmti, Trace *trace, TraceFlavor flavor)
-{
-    TraceInfo *tinfo;
-    jlong      hashCode;
-
-    /* Calculate hash code (outside critical section to lessen contention) */
-    hashCode = hashTrace(trace);
-
-    /* Do a lookup in the hash table */
-    enterCriticalSection(jvmti); {
-        TraceInfo *prev;
-        int        hashIndex;
-
-        /* Start with first item in hash buck chain */
-        prev = NULL;
-        hashIndex = (int)(hashCode & HASH_INDEX_MASK);
-        tinfo = gdata->hashBuckets[hashIndex];
-        while ( tinfo != NULL ) {
-            if ( tinfo->hashCode == hashCode &&
-                 memcmp(trace, &(tinfo->trace), sizeof(Trace))==0 ) {
-                 /* We found one that matches, move to head of bucket chain */
-                 if ( prev != NULL ) {
-                     /* Remove from list and add to head of list */
-                     prev->next = tinfo->next;
-                     tinfo->next = gdata->hashBuckets[hashIndex];
-                     gdata->hashBuckets[hashIndex] = tinfo;
-                 }
-                 /* Break out */
-                 break;
-            }
-            prev = tinfo;
-            tinfo = tinfo->next;
-        }
-
-        /* If we didn't find anything we need to enter a new entry */
-        if ( tinfo == NULL ) {
-            /* Create new hash table element */
-            tinfo = newTraceInfo(trace, hashCode, flavor);
-        }
-
-        /* Update stats */
-        (void)updateStats(tinfo);
-    
-    } exitCriticalSection(jvmti);
-    
-    return tinfo;
-}
-
-/* Get TraceInfo for this allocation */
-static TraceInfo *
-findTraceInfo(jvmtiEnv *jvmti, jthread thread, TraceFlavor flavor)
-{
-    TraceInfo *tinfo;
-    jvmtiError error;
-    
-    tinfo = NULL;
-    if ( thread != NULL ) {
-        static Trace  empty;
-        Trace         trace;
-
-        /* Before VM_INIT thread could be NULL, watch out */
-        trace = empty;
-        error = (*jvmti)->GetStackTrace(jvmti, thread, 0, MAX_FRAMES+2,
-                            trace.frames, &(trace.nframes));
-        /* If we get a PHASE error, the VM isn't ready, or it died */
-        if ( error == JVMTI_ERROR_WRONG_PHASE ) {
-            /* It is assumed this is before VM_INIT */
-            if ( flavor == TRACE_USER ) {
-                tinfo = emptyTrace(TRACE_BEFORE_VM_INIT);
-            } else {
-                tinfo = emptyTrace(flavor);
-            }
-        } else {
-            check_jvmti_error(jvmti, error, "Cannot get stack trace");
-            /* Lookup this entry */
-            tinfo = lookupOrEnter(jvmti, &trace, flavor);
-        }
-    } else {
-        /* If thread==NULL, it's assumed this is before VM_START */
-        if ( flavor == TRACE_USER ) {
-            tinfo = emptyTrace(TRACE_BEFORE_VM_START);
-        } else {
-            tinfo = emptyTrace(flavor);
-        }
-    }
-    return tinfo;
-}
-
 /* Tag an object with a TraceInfo pointer. */
 static void
-tagObjectWithTraceInfo(jvmtiEnv *jvmti, jobject object, TraceInfo *tinfo)
+tagObject(jvmtiEnv *jvmti, jobject object, jthread thread)
 {
     jvmtiError error;
     jlong      tag;
+    ThreadAgentData *threadData;
+
+/*    
+    error = (*jvmti)->GetThreadLocalStorage(jvmti, thread, (void**)&threadData);
+    check_jvmti_error(jvmti, error, "Cannot get thread local storage");
     
-    /* Tag this object with this TraceInfo pointer */
-    tag = (jlong)(ptrdiff_t)(void*)tinfo;
-    error = (*jvmti)->SetTag(jvmti, object, tag);
-    check_jvmti_error(jvmti, error, "Cannot tag object");
+    if( threadData != NULL ) {
+    */
+      /* Tag this object with this TraceInfo pointer */
+//      tag = threadData->requestId;
+      tag = thread_local_requestId;
+      error = (*jvmti)->SetTag(jvmti, object, tag);
+      /*
+    }
+    */
 }
 
 /* Java Native Method for Object.<init> */
 static void
 HEAP_TRACKER_native_newobj(JNIEnv *env, jclass klass, jthread thread, jobject o)
 {
-    TraceInfo *tinfo;
     
     if ( gdata->vmDead ) {
         return;
     }
-    tinfo = findTraceInfo(gdata->jvmti, thread, TRACE_USER);
-    tagObjectWithTraceInfo(gdata->jvmti, o, tinfo);
+
+    tagObject(gdata->jvmti, o, thread);
 }
 
 /* Java Native Method for newarray */
 static void
 HEAP_TRACKER_native_newarr(JNIEnv *env, jclass klass, jthread thread, jobject a)
 {
-    TraceInfo *tinfo;
     
     if ( gdata->vmDead ) {
         return;
     }
-    tinfo = findTraceInfo(gdata->jvmti, thread, TRACE_USER);
-    tagObjectWithTraceInfo(gdata->jvmti, a, tinfo);
+
+    tagObject(gdata->jvmti, a, thread);
+}
+
+
+static void HEAP_TRACKER_native_start_request(JNIEnv *env, jthread thread, jint requestId)
+{
+    ThreadAgentData *threadData;
+    jvmtiError error;
+
+/*
+    error = (*jvmti)->GetThreadLocalStorage(jvmti, thread, (void**)&threadData);
+    
+    if( threadData != NULL ) 
+    {
+      threadData->requestId = requestId;
+    }
+    else
+    {
+      threadData = (ThreadAgentData*)calloc(1, sizeof(ThreadAgentData));
+      error = (*jvmti)->SetThreadLocalStorage(jvmti, thread, threadData);
+      check_jvmti_error(jvmti, error, "Cannot get thread local storage");
+    }  
+    */
+
+    stdout_message("start request called");
+
+    thread_local_requestId = requestId;
 }
 
 /* Callback for JVMTI_EVENT_VM_START */
@@ -419,10 +256,6 @@ static jint JNICALL
 cbObjectTagger(jlong class_tag, jlong size, jlong* tag_ptr, jint length, 
                void *user_data)
 {
-    TraceInfo *tinfo;
-    
-    tinfo = emptyTrace(TRACE_BEFORE_VM_INIT);
-    *tag_ptr = (jlong)(ptrdiff_t)(void*)tinfo;
     return JVMTI_VISIT_OBJECTS;
 }
 
@@ -448,167 +281,70 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
     } exitCriticalSection(jvmti);
 }
 
+typedef struct RequestStats
+{
+  int requestId;
+  int objectCount;
+  int memoryUsed;
+  int arrayCount;
+  struct RequestStats *next;
+} RequestStats;
+
+#define STATS_BUCKET_COUNT 1024*8
+
+RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
+{
+  RequestStats *stats;
+  int hash;
+
+  hash = needle % STATS_BUCKET_COUNT;
+  stats = buckets[hash];
+  do {
+    if(stats->requestId == needle) 
+    {
+      return stats;
+    }
+ 
+    stats = stats->next;
+  } while(stats != NULL);
+  
+  // if we reach here, allocate a new stats object
+  stats = (RequestStats*)calloc(1, sizeof(RequestStats));
+  stats->requestId = needle;
+  
+  // and append it to the chain in the appropriate bucket
+  stats->next = buckets[hash];
+  buckets[hash] = buckets[hash];
+  
+  return stats;
+}
+
 /* Iterate Through Heap callback */
 static jint JNICALL
 cbObjectSpaceCounter(jlong class_tag, jlong size, jlong* tag_ptr, jint length,
                      void *user_data)
 {
-    TraceInfo *tinfo;
-    
-    tinfo = (TraceInfo*)(ptrdiff_t)(*tag_ptr);
-    if ( tinfo == NULL ) {
-        tinfo = emptyTrace(TRACE_MYSTERY);
-        *tag_ptr = (jlong)(ptrdiff_t)(void*)tinfo;
-    }
-    tinfo->totalSpace += size;
-    return JVMTI_VISIT_OBJECTS;
-}
-
-/* Qsort compare function */
-static int
-compareInfo(const void *p1, const void *p2)
-{
-    TraceInfo *tinfo1, *tinfo2;
-    
-    tinfo1 = *((TraceInfo**)p1);
-    tinfo2 = *((TraceInfo**)p2);
-    return (int)(tinfo2->totalSpace - tinfo1->totalSpace);
-}
-
-/* Frame to text */
-static void
-frameToString(jvmtiEnv *jvmti, char *buf, int buflen, jvmtiFrameInfo *finfo)
-{
-    jvmtiError           error;
-    jclass               klass;
-    char                *signature;
-    char                *methodname;
-    char                *methodsig;
-    jboolean             isNative;
-    char                *filename;
-    int                  lineCount;
-    jvmtiLineNumberEntry*lineTable;
-    int                  lineNumber;
-   
-    /* Initialize defaults */
-    buf[0]     = 0;
-    klass      = NULL;
-    signature  = NULL;
-    methodname = NULL;
-    methodsig  = NULL;
-    isNative   = JNI_FALSE;
-    filename   = NULL;
-    lineCount  = 0;
-    lineTable  = NULL;
-    lineNumber = 0;
-   
-    /* Get jclass object for the jmethodID */
-    error = (*jvmti)->GetMethodDeclaringClass(jvmti, finfo->method, &klass);
-    check_jvmti_error(jvmti, error, "Cannot get method's class");
-
-    /* Get the class signature */
-    error = (*jvmti)->GetClassSignature(jvmti, klass, &signature, NULL);
-    check_jvmti_error(jvmti, error, "Cannot get class signature");
-
-    /* Skip all this if it's our own Tracker method */
-    if ( strcmp(signature, "L" STRING(HEAP_TRACKER_class) ";" ) == 0 ) {
-        deallocate(jvmti, signature);
-        return;
-    }
-
-    /* Get the name and signature for the method */
-    error = (*jvmti)->GetMethodName(jvmti, finfo->method, 
-                &methodname, &methodsig, NULL);
-    check_jvmti_error(jvmti, error, "Cannot method name");
-   
-    /* Check to see if it's a native method, which means no lineNumber */
-    error = (*jvmti)->IsMethodNative(jvmti, finfo->method, &isNative);
-    check_jvmti_error(jvmti, error, "Cannot get method native status");
+  RequestStats **buckets = (RequestStats **)user_data;
   
-    /* Get source file name */
-    error = (*jvmti)->GetSourceFileName(jvmti, klass, &filename);
-    if ( error != JVMTI_ERROR_NONE && error != JVMTI_ERROR_ABSENT_INFORMATION ) {
-        check_jvmti_error(jvmti, error, "Cannot get source filename");
-    }
-        
-    /* Get lineNumber if we can */
-    if ( !isNative ) {
-        int i;
-
-        /* Get method line table */
-        error = (*jvmti)->GetLineNumberTable(jvmti, finfo->method, &lineCount, &lineTable);
-        if ( error == JVMTI_ERROR_NONE ) {
-            /* Search for line */
-            lineNumber = lineTable[0].line_number;
-            for ( i = 1 ; i < lineCount ; i++ ) {
-                if ( finfo->location < lineTable[i].start_location ) {
-                    break;
-                }
-                lineNumber = lineTable[i].line_number;
-            }
-        } else if ( error != JVMTI_ERROR_ABSENT_INFORMATION ) {
-            check_jvmti_error(jvmti, error, "Cannot get method line table");
-        }
-    }
-
-    /* Create string for this frame location.
-     *    NOTE: These char* quantities are mUTF (Modified UTF-8) bytes
-     *          and should actually be converted to the default system
-     *          character encoding. Sending them to things like
-     *          printf() without converting them is actually an I18n
-     *          (Internationalization) error.
-     */
-    (void)sprintf(buf, "%s.%s@%d[%s:%d]", 
-            (signature==NULL?"UnknownClass":signature), 
-            (methodname==NULL?"UnknownMethod":methodname), 
-            (int)finfo->location, 
-            (filename==NULL?"UnknownFile":filename), 
-            lineNumber);
-
-    /* Free up JVMTI space allocated by the above calls */
-    deallocate(jvmti, signature);
-    deallocate(jvmti, methodname);
-    deallocate(jvmti, methodsig);
-    deallocate(jvmti, filename);
-    deallocate(jvmti, lineTable);
-}
-
-/* Print the information */
-static void
-printTraceInfo(jvmtiEnv *jvmti, int index, TraceInfo* tinfo)
-{
-    if ( tinfo == NULL ) {
-        fatal_error("%d: NULL ENTRY ERROR\n", index);
-        return;
-    }
+  jlong tag = *tag_ptr;
+  if(tag != 0) {
+    RequestStats *stats = findOrCreateRequestStats(buckets, tag);
     
-    stdout_message("%2d: %7d bytes %5d objects %5d live %s",
-                index, (int)tinfo->totalSpace, tinfo->totalCount, 
-                tinfo->useCount, flavorDesc[tinfo->trace.flavor]);
-    
-    if (  tinfo->trace.nframes > 0 ) {
-        int i;
-        int fcount;
+    // accum memory used by this request
+    stats->memoryUsed+=size;
 
-        fcount = 0;
-        stdout_message(" stack=(");
-        for ( i = 0 ; i < tinfo->trace.nframes ; i++ ) {
-            char buf[4096];
-
-            frameToString(jvmti, buf, (int)sizeof(buf), tinfo->trace.frames+i);
-            if ( buf[0] == 0 ) {
-                continue; /* Skip the ones that are from Tracker class */
-            }
-            fcount++;
-            stdout_message("%s", buf);
-            if ( i < (tinfo->trace.nframes-1) ) {
-                stdout_message(",");
-            }
-        }
-        stdout_message(") nframes=%d\n", fcount);
-    } else {
-        stdout_message(" stack=<empty>\n");
+    // is it an array?
+    if(length >= 0) 
+    {
+      stats->arrayCount ++;
+    } 
+    else
+    {
+      stats->objectCount ++;
     }
+  }
+
+  return JVMTI_VISIT_OBJECTS;
 }
 
 /* Callback for JVMTI_EVENT_VM_DEATH */
@@ -624,17 +360,39 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
     error = (*jvmti)->ForceGarbageCollection(jvmti);
     check_jvmti_error(jvmti, error, "Cannot force garbage collection");
     
-    /* Iterate through heap and find all objects */
-    (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
-    heapCallbacks.heap_iteration_callback = &cbObjectSpaceCounter;
-    error = (*jvmti)->IterateThroughHeap(jvmti, 0, NULL, &heapCallbacks, NULL);
-    check_jvmti_error(jvmti, error, "Cannot iterate through heap");
 
     /* Process VM Death */
     enterCriticalSection(jvmti); {
         jclass              klass;
         jfieldID            field;
         jvmtiEventCallbacks callbacks;
+        RequestStats **stats_buckets;
+        int i;
+
+    /* walk heap and collect stats on what objects remain */
+
+    stats_buckets  = (RequestStats **)calloc(STATS_BUCKET_COUNT, sizeof( RequestStats * )); 
+    
+    /* Iterate through heap and find all objects */
+    (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
+    heapCallbacks.heap_iteration_callback = &cbObjectSpaceCounter;
+    error = (*jvmti)->IterateThroughHeap(jvmti, 0, NULL, &heapCallbacks, stats_buckets);
+    check_jvmti_error(jvmti, error, "Cannot iterate through heap");
+
+    /* walk through collected stats objects and print them out */    
+    for(i=0;i<STATS_BUCKET_COUNT;i++) 
+    {
+      RequestStats *stats;
+      
+      stats = stats_buckets[i];
+      while(stats != NULL) {
+        fprintf(stdout, "request %d, objectCount %d, memoryUsed %d, arrayCount %d\n", stats->requestId, stats->objectCount, stats->arrayCount);
+        stats = stats->next;
+      }
+    }
+    
+    free(stats_buckets);
+
 
         /* Disengage calls in HEAP_TRACKER_class. */
         klass = (*env)->FindClass(env, STRING(HEAP_TRACKER_class));
@@ -658,6 +416,8 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
         error = (*jvmti)->SetEventCallbacks(jvmti, &callbacks, 
                                             (jint)sizeof(callbacks));
         check_jvmti_error(jvmti, error, "Cannot set jvmti callbacks");
+
+        stdout_message("in VmDeath finishing up...\n");
         
         /* Since this critical section could be holding up other threads
          *   in other event callbacks, we need to indicate that the VM is
@@ -668,51 +428,7 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
          */
         gdata->vmDead = JNI_TRUE;
 
-        /* Dump all objects */
-        if ( gdata->traceInfoCount > 0 ) {
-            TraceInfo **list;
-            int         count;
-            int         i;
-           
-            stdout_message("Dumping heap trace information\n");
-
-            /* Create single array of pointers to TraceInfo's, sort, and
-             *   print top gdata->maxDump top space users.
-             */
-            list = (TraceInfo**)calloc(gdata->traceInfoCount, 
-                                              sizeof(TraceInfo*));
-            if ( list == NULL ) {
-                fatal_error("ERROR: Ran out of malloc() space\n");
-            }
-            count = 0;
-            for ( i = 0 ; i < HASH_BUCKET_COUNT ; i++ ) {
-                TraceInfo *tinfo;
-
-                tinfo = gdata->hashBuckets[i];
-                while ( tinfo != NULL ) {
-                    if ( count < gdata->traceInfoCount ) {
-                        list[count++] = tinfo;
-                    }
-                    tinfo = tinfo->next;
-                }
-            }
-            if ( count != gdata->traceInfoCount ) {
-                fatal_error("ERROR: Count found by iterate doesn't match ours:"
-                        " count=%d != traceInfoCount==%d\n",
-                        count, gdata->traceInfoCount);
-            }
-            qsort(list, count, sizeof(TraceInfo*), &compareInfo);
-            for ( i = 0 ; i < count ; i++ ) {
-                if ( i >= gdata->maxDump ) {
-                    break;
-                }
-                printTraceInfo(jvmti, i+1, list[i]);
-            }
-            (void)free(list);
-        }
-
     } exitCriticalSection(jvmti);
-        
 }  
 
 /* Callback for JVMTI_EVENT_VM_OBJECT_ALLOC */
@@ -720,30 +436,17 @@ static void JNICALL
 cbVMObjectAlloc(jvmtiEnv *jvmti, JNIEnv *env, jthread thread, 
                 jobject object, jclass object_klass, jlong size)
 {
-    TraceInfo *tinfo;
-    
     if ( gdata->vmDead ) {
         return;
     }
-    tinfo = findTraceInfo(jvmti, thread, TRACE_VM_OBJECT);
-    tagObjectWithTraceInfo(jvmti, object, tinfo);
+    
+    tagObject(jvmti, object, thread);
 }
 
 /* Callback for JVMTI_EVENT_OBJECT_FREE */
 static void JNICALL
 cbObjectFree(jvmtiEnv *jvmti, jlong tag)
 {
-    TraceInfo *tinfo;
-  
-    if ( gdata->vmDead ) {
-        return;
-    }
-    
-    /* The object tag is actually a pointer to a TraceInfo structure */
-    tinfo = (TraceInfo*)(void*)(ptrdiff_t)tag;
-    
-    /* Decrement the use count */
-    tinfo->useCount--;
 }
 
 /* Callback for JVMTI_EVENT_CLASS_FILE_LOAD_HOOK */
@@ -839,54 +542,6 @@ cbClassFileLoadHook(jvmtiEnv *jvmti, JNIEnv* env,
     } exitCriticalSection(jvmti);
 }
 
-/* Parse the options for this heapTracker agent */
-static void
-parse_agent_options(char *options)
-{
-    #define MAX_TOKEN_LENGTH        16
-    char  token[MAX_TOKEN_LENGTH];
-    char *next;
-
-    /* Defaults */
-    gdata->maxDump = 20;
-
-    /* Parse options and set flags in gdata */
-    if ( options==NULL ) {
-        return;
-    }
-   
-    /* Get the first token from the options string. */
-    next = get_token(options, ",=", token, (int)sizeof(token));
-
-    /* While not at the end of the options string, process this option. */
-    while ( next != NULL ) {
-        if ( strcmp(token,"help")==0 ) {
-            stdout_message("The heapTracker JVMTI demo agent\n");
-            stdout_message("\n");
-            stdout_message(" java -agent:heapTracker[=options] ...\n");
-            stdout_message("\n");
-            stdout_message("The options are comma separated:\n");
-            stdout_message("\t help\t\t\t Print help information\n");
-            stdout_message("\t maxDump=n\t\t\t How many TraceInfo's to dump\n");
-            stdout_message("\n");
-            exit(0);
-        } else if ( strcmp(token,"maxDump")==0 ) {
-            char  number[MAX_TOKEN_LENGTH];
-            
-            next = get_token(next, ",=", number, (int)sizeof(number));
-            if ( next == NULL ) {
-                fatal_error("ERROR: Cannot parse maxDump=number: %s\n", options);
-            }
-            gdata->maxDump = atoi(number);
-        } else if ( token[0]!=0 ) {
-            /* We got a non-empty token and we don't know what it is. */
-            fatal_error("ERROR: Unknown option: %s\n", token);
-        }
-        /* Get the next token (returns NULL if there are no more) */
-        next = get_token(next, ",=", token, (int)sizeof(token));
-    }
-}
-
 /* Agent_OnLoad: This is called immediately after the shared library is 
  *   loaded. This is the first code executed.
  */
@@ -897,10 +552,8 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     jvmtiEnv              *jvmti;
     jvmtiError             error;
     jint                   res;
-    TraceFlavor            flavor;
     jvmtiCapabilities      capabilities;
     jvmtiEventCallbacks    callbacks;
-    static Trace           empty;
     
     /* Setup initial global agent data area 
      *   Use of static/extern data should be handled carefully here.
@@ -925,9 +578,6 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
 
     /* Here we save the jvmtiEnv* for Agent_OnUnload(). */
     gdata->jvmti = jvmti;
-   
-    /* Parse any options supplied on java command line */
-    parse_agent_options(options);
    
     /* Immediately after getting the jvmtiEnv* we need to ask for the
      *   capabilities this agent will need. 
@@ -989,12 +639,6 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
      */
     error = (*jvmti)->CreateRawMonitor(jvmti, "agent data", &(gdata->lock));
     check_jvmti_error(jvmti, error, "Cannot create raw monitor");
-
-    /* Create the TraceInfo for various flavors of empty traces */
-    for ( flavor = TRACE_FIRST ; flavor <= TRACE_LAST ; flavor++ ) {
-        gdata->emptyTrace[flavor] = 
-               newTraceInfo(&empty, hashTrace(&empty), flavor);
-    }
 
     /* Add jar file to boot classpath */
     add_demo_jar_to_bootclasspath(jvmti, "heapTracker");

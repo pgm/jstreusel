@@ -38,12 +38,17 @@
 /* Java class to hold static methods which will be called in byte code
  *    injections of all class files.
  */
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class HeapTracker {
- 
+
+//    private static final AtomicInteger uniqueId = new AtomicInteger(1); 
     private static int engaged = 0; 
   
     private static native void _newobj(Object thread, Object o);
+/*    private static native void _start_request(Object thread, int requestId); */
+    private static native void _newarr(Object thread, Object a);
+    
     public static void newobj(Object o)
     {
 	if ( engaged != 0 ) {
@@ -51,13 +56,24 @@ public class HeapTracker {
 	}
     }
     
-    private static native void _newarr(Object thread, Object a);
     public static void newarr(Object a)
     {
 	if ( engaged != 0 ) {
 	    _newarr(Thread.currentThread(), a);
 	}
     }
-    
+
+/*
+  public static void startRequest()
+  {
+    int id = uniqueId.getAndIncrement();
+    _start_request(Thread.currentThread(), id);
+  }
+
+  public static void endRequest()
+  {
+    _start_request(Thread.currentThread(), 0);
+  }
+*/    
 }
 
