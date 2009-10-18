@@ -1,5 +1,5 @@
 #
-# @(#)sample.makefile.txt	1.7 05/11/17
+# @(#)sample.makefile.txt	1.5 05/11/17
 # 
 # Copyright (c) 2006 Sun Microsystems, Inc. All Rights Reserved.
 # 
@@ -36,7 +36,7 @@
 
 ########################################################################
 #
-# Sample GNU Makefile for building JVMTI Demo heapTracker
+# Sample GNU Makefile for building
 #
 #  Example uses:    
 #       gnumake JDK=<java_home> OSNAME=solaris [OPT=true] [LIBARCH=sparc]
@@ -47,12 +47,8 @@
 ########################################################################
 
 # Source lists
-LIBNAME=heapTracker
-SOURCES=heapTracker.c agent_util/agent_util.c java_crw_demo/java_crw_demo.c
-JAVA_SOURCES=HeapTracker.java TestHeapTracking.java
-
-# Name of jar file that needs to be created
-JARFILE=heapTracker.jar
+LIBNAME=java_crw_demo
+SOURCES=java_crw_demo.c
 
 # Solaris Sun C Compiler Version 5.5
 ifeq ($(OSNAME), solaris)
@@ -79,7 +75,7 @@ ifeq ($(OSNAME), solaris)
     LIBRARY=lib$(LIBNAME).so
     LDFLAGS=-z defs -ztext
     # Libraries we are dependent on
-    LIBRARIES=-L $(JDK)/jre/lib/$(LIBARCH) -ljava_crw_demo -lc
+    LIBRARIES=-lc
     # Building a shared library
     LINK_SHARED=$(LINK.c) -G -o $@
 endif
@@ -101,7 +97,7 @@ ifeq ($(OSNAME), linux)
     LIBRARY=lib$(LIBNAME).so
     LDFLAGS=-Wl,-soname=$(LIBRARY) -static-libgcc -mimpure-text
     # Libraries we are dependent on
-    LIBRARIES=-L $(JDK)/jre/lib/$(LIBARCH) -lc
+    LIBRARIES=-lc
     # Building a shared library
     LINK_SHARED=$(LINK.c) -shared -o $@
 endif
@@ -118,48 +114,32 @@ ifeq ($(OSNAME), win32)
     else
         CFLAGS= -Od -Zi $(COMMON_FLAGS) 
     endif
-    # Sources need java_crw_demo
-    SOURCES += ../java_crw_demo/java_crw_demo.c
     # Object files needed to create library
     OBJECTS=$(SOURCES:%.c=%.obj)
     # Library name and options needed to build it
     LIBRARY=$(LIBNAME).dll
     LDFLAGS=
     # Libraries we are dependent on
-    LIBRARIES=$(JDK)/
+    LIBRARIES=
     # Building a shared library
     LINK_SHARED=link -dll -out:$@
 endif
 
 # Common -I options
 CFLAGS += -I.
-CFLAGS += -Iagent_util
-CFLAGS += -Ijava_crw_demo
 CFLAGS += -I$(JDK)/include -I$(JDK)/include/$(OSNAME)
 
 # Default rule (build both native library and jar file)
-all: $(LIBRARY) $(JARFILE)
+all: $(LIBRARY)
 
 # Build native library
 $(LIBRARY): $(OBJECTS)
 	$(LINK_SHARED) $(OBJECTS) $(LIBRARIES)
 
-# Build jar file
-$(JARFILE): $(JAVA_SOURCES)
-	rm -f -r classes
-	mkdir -p classes
-	$(JDK)/bin/javac -d classes $(JAVA_SOURCES)
-	(cd classes; $(JDK)/bin/jar cf ../$@ *)
-
 # Cleanup the built bits
 clean:
 	rm -f -r classes
-	rm -f $(LIBRARY) $(JARFILE) $(OBJECTS)
-
-# Simple tester
-test: all
-	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) TestHeapTracking
-#	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) -version
+	rm -f $(LIBRARY) $(OBJECTS)
 
 # Compilation rule only needed on Windows
 ifeq ($(OSNAME), win32)
