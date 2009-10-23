@@ -74,7 +74,7 @@
  * 
  */
 
-#define HEAP_TRACKER_class           HeapTrackerJNISupport /* Name of class we are using */
+#define HEAP_TRACKER_class           "com/github/jstreusel/HeapTrackerJNISupport" /* Name of class we are using */
 #define HEAP_TRACKER_newobj        newobj   /* Name of java init method */
 #define HEAP_TRACKER_newarr        newarr   /* Name of java newarray method */
 #define HEAP_TRACKER_native_newobj _newobj  /* Name of java newobj native */
@@ -107,14 +107,7 @@ typedef struct {
     jint           ccount;
 } GlobalAgentData;
 
-/* per-thread state */
-typedef struct {
-  jlong requestId;
-} ThreadAgentData;
-
 static GlobalAgentData *gdata;
-
-__thread int thread_local_requestId = 0;
 
 typedef struct RequestStats
 {
@@ -156,7 +149,7 @@ tagObject(jvmtiEnv *jvmti, jobject object, jthread thread)
 {
     jvmtiError error;
     jlong      tag;
-    ThreadAgentData *threadData;
+    void *threadData;
 
 /*    
     error = (*jvmti)->GetThreadLocalStorage(jvmti, thread, (void**)&threadData);
@@ -166,7 +159,12 @@ tagObject(jvmtiEnv *jvmti, jobject object, jthread thread)
     */
       /* Tag this object with this TraceInfo pointer */
 //      tag = threadData->requestId;
-      tag = thread_local_requestId;
+
+      error = (*jvmti)->GetThreadLocalStorage(jvmti, thread, (void**)&threadData);
+      check_jvmti_error(jvmti, error, "Cannot get thread local storage");
+      
+      tag = (jlong)threadData;
+
       error = (*jvmti)->SetTag(jvmti, object, tag);
       /*
     }
@@ -250,19 +248,22 @@ static void HEAP_TRACKER_native_extract_stats(JNIEnv *env, jclass klass, jclass 
 
 static void HEAP_TRACKER_native_start_request(JNIEnv *env, jclass klass, jthread thread, jint requestId)
 {
-    ThreadAgentData *threadData;
     jvmtiError error;
+    jvmtiEnv *jvmti = gdata->jvmti;
 
     fprintf(stdout, "start request called: %d\n", requestId);
     fflush(stdout);
 
-    thread_local_requestId = requestId;
+
+    error = (*jvmti)->SetThreadLocalStorage(jvmti, thread, (void*)requestId);
+    check_jvmti_error(jvmti, error, "Cannot set thread local storage");
 }
 
 /* Callback for JVMTI_EVENT_VM_START */
 static void JNICALL
 cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
 {
+  stdout_message("cbVMStart");
     enterCriticalSection(jvmti); {
         jclass klass;
         jfieldID field;
@@ -281,22 +282,22 @@ cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
         };
         
         /* Register Natives for class whose methods we use */
-        klass = (*env)->FindClass(env, STRING(HEAP_TRACKER_class));
+        klass = (*env)->FindClass(env, HEAP_TRACKER_class);
         if ( klass == NULL ) {
             fatal_error("ERROR: JNI: Cannot find %s with FindClass\n", 
-                        STRING(HEAP_TRACKER_class));
+                        HEAP_TRACKER_class);
         }
         rc = (*env)->RegisterNatives(env, klass, registry, 4);
         if ( rc != 0 ) {
             fatal_error("ERROR: JNI: Cannot register natives for class %s\n", 
-                        STRING(HEAP_TRACKER_class));
+                        HEAP_TRACKER_class);
         }
         
         /* Engage calls. */
         field = (*env)->GetStaticFieldID(env, klass, STRING(HEAP_TRACKER_engaged), "I");
         if ( field == NULL ) {
             fatal_error("ERROR: JNI: Cannot get field from %s\n", 
-                        STRING(HEAP_TRACKER_class));
+                        HEAP_TRACKER_class);
         }
         (*env)->SetStaticIntField(env, klass, field, 1);
 
@@ -304,6 +305,9 @@ cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
         gdata->vmStarted = JNI_TRUE;
     
     } exitCriticalSection(jvmti);
+  stdout_message("cbVMStart exit");
+  
+  fflush(stdout);
 }
 
 /* Iterate Through Heap callback */
@@ -321,6 +325,8 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
     jvmtiHeapCallbacks heapCallbacks;
     jvmtiError         error;
     
+    stdout_message("cbVMInit\n");
+
     /* Iterate through heap, find all untagged objects allocated before this */
     (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
     heapCallbacks.heap_iteration_callback = &cbObjectTagger;
@@ -334,6 +340,8 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
         gdata->vmInitialized = JNI_TRUE;
     
     } exitCriticalSection(jvmti);
+
+    stdout_message("cbVMInit end\n");
 }
 
 
@@ -457,15 +465,15 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
         jvmtiEventCallbacks callbacks;
 
         /* Disengage calls in HEAP_TRACKER_class. */
-        klass = (*env)->FindClass(env, STRING(HEAP_TRACKER_class));
+        klass = (*env)->FindClass(env, HEAP_TRACKER_class);
         if ( klass == NULL ) {
             fatal_error("ERROR: JNI: Cannot find %s with FindClass\n", 
-                        STRING(HEAP_TRACKER_class));
+                        HEAP_TRACKER_class);
         }
         field = (*env)->GetStaticFieldID(env, klass, STRING(HEAP_TRACKER_engaged), "I");
         if ( field == NULL ) {
             fatal_error("ERROR: JNI: Cannot get field from %s\n", 
-                        STRING(HEAP_TRACKER_class));
+                        HEAP_TRACKER_class);
         }
         (*env)->SetStaticIntField(env, klass, field, 0);
 
@@ -543,7 +551,7 @@ cbClassFileLoadHook(jvmtiEnv *jvmti, JNIEnv* env,
             *new_class_data     = NULL;
 
             /* The tracker class itself? */
-            if ( strcmp(classname, STRING(HEAP_TRACKER_class)) != 0 ) {
+            if ( strcmp(classname, HEAP_TRACKER_class) != 0 ) {
                 jint           cnum;
                 int            systemClass;
                 unsigned char *newImage;
@@ -570,8 +578,8 @@ cbClassFileLoadHook(jvmtiEnv *jvmti, JNIEnv* env,
                     class_data,
                     class_data_len,
                     systemClass,
-                    STRING(HEAP_TRACKER_class),
-                    "L" STRING(HEAP_TRACKER_class) ";",
+                    HEAP_TRACKER_class,
+                    "L" HEAP_TRACKER_class ";",
                     NULL, NULL,
                     NULL, NULL,
                     STRING(HEAP_TRACKER_newobj), "(Ljava/lang/Object;)V",
@@ -616,6 +624,10 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     jint                   res;
     jvmtiCapabilities      capabilities;
     jvmtiEventCallbacks    callbacks;
+
+
+    stdout_message("hello\n");
+
     
     /* Setup initial global agent data area 
      *   Use of static/extern data should be handled carefully here.
@@ -653,6 +665,8 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     capabilities.can_generate_vm_object_alloc_events  = 1;
     error = (*jvmti)->AddCapabilities(jvmti, &capabilities);
     check_jvmti_error(jvmti, error, "Unable to get necessary JVMTI capabilities.");
+
+    stdout_message("hello1\n");
     
     /* Next we need to provide the pointers to the callback functions to
      *   to this jvmtiEnv*
@@ -677,6 +691,7 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
      *   initialization, VM death, and Class File Loads. 
      *   Once the VM is initialized we will request more events.
      */
+
     error = (*jvmti)->SetEventNotificationMode(jvmti, JVMTI_ENABLE, 
                           JVMTI_EVENT_VM_START, (jthread)NULL);
     check_jvmti_error(jvmti, error, "Cannot set event notification");
@@ -703,7 +718,9 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     check_jvmti_error(jvmti, error, "Cannot create raw monitor");
 
     /* Add jar file to boot classpath */
-    add_demo_jar_to_bootclasspath(jvmti, "heapTracker");
+/*    add_demo_jar_to_bootclasspath(jvmti, "heapTracker"); */
+
+    stdout_message("hello2\n");
 
     /* We return JNI_OK to signify success */
     return JNI_OK;
