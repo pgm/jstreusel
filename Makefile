@@ -42,14 +42,16 @@
 #       gnumake JDK=<java_home> OSNAME=solaris [OPT=true] [LIBARCH=sparc]
 #       gnumake JDK=<java_home> OSNAME=solaris [OPT=true] [LIBARCH=sparcv9]
 #       gnumake JDK=<java_home> OSNAME=linux   [OPT=true]
-#       gnumake JDK=<java_home> OSNAME=win32   [OPT=true]
+#
+#  If building under windows use the win_build.bat file
 #
 ########################################################################
 
 # Source lists
 LIBNAME=heapTracker
 SOURCES=heapTracker.c agent_util/agent_util.c java_crw_demo/java_crw_demo.c
-JAVA_SOURCES=HeapTracker.java TestHeapTracking.java
+JAVA_SOURCES=java/com/github/jstreusel/HeapTracker.java java/com/github/jstreusel/HeapTrackerJNISupport.java java/com/github/jstreusel/IHeapTracker.java java/com/github/jstreusel/RequestStats.java java/com/github/jstreusel/TestHeapTracking.java
+
 
 # Name of jar file that needs to be created
 JARFILE=heapTracker.jar
@@ -106,31 +108,6 @@ ifeq ($(OSNAME), linux)
     LINK_SHARED=$(LINK.c) -shared -o $@
 endif
 
-# Windows Microsoft C/C++ Optimizing Compiler Version 12
-ifeq ($(OSNAME), win32)
-    CC=cl
-    # Compiler options needed to build it
-    COMMON_FLAGS=-Gy -DWIN32
-    # Options that help find errors
-    COMMON_FLAGS+=-W0 -WX
-    ifeq ($(OPT), true)
-        CFLAGS= -Ox -Op -Zi $(COMMON_FLAGS) 
-    else
-        CFLAGS= -Od -Zi $(COMMON_FLAGS) 
-    endif
-    # Sources need java_crw_demo
-    SOURCES += ../java_crw_demo/java_crw_demo.c
-    # Object files needed to create library
-    OBJECTS=$(SOURCES:%.c=%.obj)
-    # Library name and options needed to build it
-    LIBRARY=$(LIBNAME).dll
-    LDFLAGS=
-    # Libraries we are dependent on
-    LIBRARIES=$(JDK)/
-    # Building a shared library
-    LINK_SHARED=link -dll -out:$@
-endif
-
 # Common -I options
 CFLAGS += -I.
 CFLAGS += -Iagent_util
@@ -161,9 +138,4 @@ test: all
 	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) TestHeapTracking
 #	LD_LIBRARY_PATH=. $(JDK)/bin/java -agentlib:$(LIBNAME) -Xbootclasspath/a:./$(JARFILE) -version
 
-# Compilation rule only needed on Windows
-ifeq ($(OSNAME), win32)
-%.obj: %.c
-	$(COMPILE.c) $<
-endif
 
