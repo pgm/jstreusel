@@ -251,10 +251,6 @@ static void HEAP_TRACKER_native_start_request(JNIEnv *env, jclass klass, jthread
     jvmtiError error;
     jvmtiEnv *jvmti = gdata->jvmti;
 
-    fprintf(stdout, "start request called: %d\n", requestId);
-    fflush(stdout);
-
-
     error = (*jvmti)->SetThreadLocalStorage(jvmti, thread, (void*)requestId);
     check_jvmti_error(jvmti, error, "Cannot set thread local storage");
 }
@@ -263,7 +259,6 @@ static void HEAP_TRACKER_native_start_request(JNIEnv *env, jclass klass, jthread
 static void JNICALL
 cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
 {
-  stdout_message("cbVMStart");
     enterCriticalSection(jvmti); {
         jclass klass;
         jfieldID field;
@@ -305,7 +300,6 @@ cbVMStart(jvmtiEnv *jvmti, JNIEnv *env)
         gdata->vmStarted = JNI_TRUE;
     
     } exitCriticalSection(jvmti);
-  stdout_message("cbVMStart exit");
   
   fflush(stdout);
 }
@@ -325,8 +319,6 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
     jvmtiHeapCallbacks heapCallbacks;
     jvmtiError         error;
     
-    stdout_message("cbVMInit\n");
-
     /* Iterate through heap, find all untagged objects allocated before this */
     (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
     heapCallbacks.heap_iteration_callback = &cbObjectTagger;
@@ -340,8 +332,6 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
         gdata->vmInitialized = JNI_TRUE;
     
     } exitCriticalSection(jvmti);
-
-    stdout_message("cbVMInit end\n");
 }
 
 
@@ -351,9 +341,6 @@ RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
   int hash;
 
   hash = needle % STATS_BUCKET_COUNT;
-//  if(buckets == NULL) {
-//    stdout_message("!!! NULL");
-//  }
   
   stats = buckets[hash];
   while(stats != NULL)
@@ -487,8 +474,6 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
                                             (jint)sizeof(callbacks));
         check_jvmti_error(jvmti, error, "Cannot set jvmti callbacks");
 
-        stdout_message("in VmDeath finishing up...\n");
-        
         /* Since this critical section could be holding up other threads
          *   in other event callbacks, we need to indicate that the VM is
          *   dead so that the other callbacks can short circuit their work.
@@ -625,10 +610,6 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     jvmtiCapabilities      capabilities;
     jvmtiEventCallbacks    callbacks;
 
-
-    stdout_message("hello\n");
-
-    
     /* Setup initial global agent data area 
      *   Use of static/extern data should be handled carefully here.
      *   We need to make sure that we are able to cleanup after ourselves
@@ -666,8 +647,6 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     error = (*jvmti)->AddCapabilities(jvmti, &capabilities);
     check_jvmti_error(jvmti, error, "Unable to get necessary JVMTI capabilities.");
 
-    stdout_message("hello1\n");
-    
     /* Next we need to provide the pointers to the callback functions to
      *   to this jvmtiEnv*
      */
@@ -719,8 +698,6 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
 
     /* Add jar file to boot classpath */
 /*    add_demo_jar_to_bootclasspath(jvmti, "heapTracker"); */
-
-    stdout_message("hello2\n");
 
     /* We return JNI_OK to signify success */
     return JNI_OK;

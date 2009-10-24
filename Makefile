@@ -49,7 +49,7 @@
 
 # Source lists
 LIBNAME=heapTracker
-SOURCES=heapTracker.c agent_util/agent_util.c java_crw_demo/java_crw_demo.c
+SOURCES=heapTracker.c agent_util.c java_crw_demo.c
 JAVA_SOURCES=java/com/github/jstreusel/HeapTracker.java java/com/github/jstreusel/HeapTrackerJNISupport.java java/com/github/jstreusel/IHeapTracker.java java/com/github/jstreusel/RequestStats.java java/com/github/jstreusel/TestHeapTracking.java
 
 
