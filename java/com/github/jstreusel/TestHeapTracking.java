@@ -23,27 +23,33 @@ public class TestHeapTracking {
 		{
 			System.out.println("request "+stat.requestId+", objectCount: "+stat.objectCount+", memoryCount: "+stat.memoryCount+", arrayCount: "+stat.arrayCount);
 		}
+
+		List a = new ArrayList(); 
 		
 		// make a thousand requests 
 		List hold = new ArrayList();
-		int byteCount = 0;
+		int loopCount = 0;
 		int chunkSize = 1000;
-		while(true)
+		boolean outofmem = false;
+		while(!outofmem)
 		{
 			tracker.startRequest();
-			try {
-				hold.add(new byte[chunkSize]);
-			} 
-			catch (OutOfMemoryError ex) 
-			{
-				break;
+			for(int i = 0;i<1000;i++) {
+				try {
+					hold.add(new byte[chunkSize]);
+				} 
+				catch (OutOfMemoryError ex) 
+				{
+					outofmem = true;
+					break;
+				}
 			}
-			byteCount += chunkSize;
+			loopCount ++;
 		}
 		
-//		System.out.println("got out of memory exception after "+(byteCount/chunkSize));
+		System.out.println("loopCount");
+		System.out.println(Integer.toString(loopCount));
 		
-		List a = null; 
 		try {
 			System.out.println("done");
 			while(true) {

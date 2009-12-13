@@ -109,6 +109,7 @@ typedef struct {
 
 static GlobalAgentData *gdata;
 
+
 typedef struct RequestStats
 {
   int requestId;
@@ -118,10 +119,16 @@ typedef struct RequestStats
   struct RequestStats *next;
 } RequestStats;
 
+typedef struct CollectedStats
+{
+  RequestStats **hashTable;
+  jboolean memoryExhausted;
+} CollectedStats;
+
 #define STATS_BUCKET_COUNT 1024*8
 
-static RequestStats **collectStats(jvmtiEnv *jvmti, JNIEnv *env);
-static void freeStats(RequestStats **stats);
+static CollectedStats *collectStats(jvmtiEnv *jvmti, JNIEnv *env);
+static void freeStats(CollectedStats *stats);
 
 /* Enter a critical section by doing a JVMTI Raw Monitor Enter */
 static void
@@ -195,9 +202,25 @@ HEAP_TRACKER_native_newarr(JNIEnv *env, jclass klass, jthread thread, jobject a)
     tagObject(gdata->jvmti, a, thread);
 }
 
+#define RETURN_IF_EXCEPTION_OCCURRED(env) \
+  if( (*env)->ExceptionOccurred(env) != NULL) \
+  { \
+    return; \
+  }
+
+static void throwInvalidArg(JNIEnv *env, char *message)
+{
+  jclass invalidArgClass = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+  if (invalidArgClass == NULL) {
+    /* Unable to find the exception class, nothing really can be done */
+    fatal_error("Attempted to throw illegal argument exception, but could not find class\n");
+  }
+  (*env)->ThrowNew(env, invalidArgClass, message);
+}
+  
 static void HEAP_TRACKER_native_extract_stats(JNIEnv *env, jclass klass, jclass statsClass, jobject list)
 {
-  RequestStats ** stats_buckets;
+  CollectedStats *stats = NULL;
   jmethodID add_methodID;  
   jmethodID constructor_methodID;
   jclass listClass;
@@ -211,39 +234,86 @@ static void HEAP_TRACKER_native_extract_stats(JNIEnv *env, jclass klass, jclass 
   check_jvmti_error(jvmti, error, "Cannot force garbage collection");
 
   enterCriticalSection(jvmti); {
-      stats_buckets = collectStats(jvmti, env);
+      stats = collectStats(jvmti, env);
   } exitCriticalSection(jvmti);
-
-  listClass = (*env)->GetObjectClass(env, list);
-  if(listClass == NULL)
-    return;
-    
-  constructor_methodID = (*env)->GetMethodID(env, statsClass, "<init>", "(IIII)V");
-  if(constructor_methodID == NULL)
-    return;
   
-  add_methodID = (*env)->GetMethodID(env, listClass, "add", "(Ljava/lang/Object;)Z");
-  if(add_methodID == NULL)
-    return;
-
-    /* walk through collected stats objects */    
-    for(i=0;i<STATS_BUCKET_COUNT;i++) 
-    {
-      RequestStats *stats;
-      
-      stats = stats_buckets[i];
-      while(stats != NULL) {
-        // construct new stats object
-        newStatsObject = (*env)->NewObject(env, statsClass, constructor_methodID, stats->requestId, stats->objectCount, stats->memoryUsed, stats->arrayCount);
-        
-        // append it to list
-        (*env)->CallVoidMethod(env, list, add_methodID, newStatsObject);
-
-        stats = stats->next;
-      }
+  if(stats == NULL || stats->memoryExhausted) {
+    jclass outOfMemExcClass;
+    
+    outOfMemExcClass = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+    if (outOfMemExcClass == NULL) {
+      /* Unable to find the exception class, nothing really can be done */
+      fatal_error("Attempted to throw out-of-memory exception, but could not find class\n");
     }
+    (*env)->ThrowNew(env, outOfMemExcClass, "Exhausted memory in collecting stats");
+    
+    goto cleanupAfterError;
+  }
 
-    freeStats(stats_buckets);
+  // get list class
+  listClass = (*env)->GetObjectClass(env, list);
+
+  if( (*env)->ExceptionOccurred(env) != NULL) 
+    goto cleanupAfterError;
+    
+  if(listClass == NULL)
+  {
+    throwInvalidArg(env, "No list class provided");
+    goto cleanupAfterError;
+  }
+
+  // get constructor of stats object
+  constructor_methodID = (*env)->GetMethodID(env, statsClass, "<init>", "(IIII)V");
+
+  if( (*env)->ExceptionOccurred(env) != NULL) 
+    goto cleanupAfterError;
+
+  if(constructor_methodID == NULL)
+  {
+    throwInvalidArg(env, "Stats class does not have expected constructor");
+    goto cleanupAfterError;
+  }
+
+  // get add method for the list class    
+  add_methodID = (*env)->GetMethodID(env, listClass, "add", "(Ljava/lang/Object;)Z");
+
+  if( (*env)->ExceptionOccurred(env) != NULL) 
+  {
+    goto cleanupAfterError;
+  }
+
+  if(add_methodID == NULL)
+  {
+    throwInvalidArg(env, "list class has no add method");
+    goto cleanupAfterError;
+  }
+
+  /* walk through collected stats objects */    
+  for(i=0;i<STATS_BUCKET_COUNT;i++) 
+  {
+    RequestStats *rstats;
+    
+    rstats = stats->hashTable[i];
+    while(rstats != NULL) {
+      // construct new stats object
+      newStatsObject = (*env)->NewObject(env, statsClass, constructor_methodID, rstats->requestId, rstats->objectCount, rstats->memoryUsed, rstats->arrayCount);
+
+      if( (*env)->ExceptionOccurred(env) != NULL) 
+        goto cleanupAfterError;
+      
+      // append it to list
+      (*env)->CallVoidMethod(env, list, add_methodID, newStatsObject);
+
+      if( (*env)->ExceptionOccurred(env) != NULL) 
+        goto cleanupAfterError;
+
+      rstats = rstats->next;
+    }
+  }
+
+cleanupAfterError:
+  if(stats != NULL)
+    freeStats(stats);
 }
 
 static void HEAP_TRACKER_native_start_request(JNIEnv *env, jclass klass, jthread thread, jint requestId)
@@ -342,6 +412,9 @@ RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
 
   hash = needle % STATS_BUCKET_COUNT;
   
+//  fprintf(stderr, "buckets=%x, hash=%x\n", (int)buckets, hash);
+//  fflush(stderr);
+  
   stats = buckets[hash];
   while(stats != NULL)
   {
@@ -355,6 +428,11 @@ RequestStats *findOrCreateRequestStats(RequestStats **buckets, int needle)
   
   // if we reach here, allocate a new stats object
   stats = (RequestStats*)calloc(1, sizeof(RequestStats));
+  if(stats == NULL)
+  {
+    return NULL;
+  }
+  
   stats->requestId = needle;
   
   // and append it to the chain in the appropriate bucket
@@ -369,11 +447,16 @@ static jint JNICALL
 cbObjectSpaceCounter(jlong class_tag, jlong size, jlong* tag_ptr, jint length,
                      void *user_data)
 {
-  RequestStats **buckets = (RequestStats **)user_data;
+  CollectedStats *result = (CollectedStats *)user_data;
   
   jlong tag = *tag_ptr;
   if(tag != 0) {
-    RequestStats *stats = findOrCreateRequestStats(buckets, tag);
+    RequestStats *stats = findOrCreateRequestStats(result->hashTable, tag);
+    if(stats == NULL) 
+    {
+      result->memoryExhausted = 1;
+      return JVMTI_VISIT_ABORT;
+    }
     
     // accum memory used by this request
     stats->memoryUsed+=size;
@@ -392,26 +475,30 @@ cbObjectSpaceCounter(jlong class_tag, jlong size, jlong* tag_ptr, jint length,
   return JVMTI_VISIT_OBJECTS;
 }
 
-static RequestStats **collectStats(jvmtiEnv *jvmti, JNIEnv *env)
+static CollectedStats *collectStats(jvmtiEnv *jvmti, JNIEnv *env)
 {
     jvmtiHeapCallbacks heapCallbacks;
     jvmtiEventCallbacks callbacks;
     RequestStats **stats_buckets;
     jvmtiError error;
-
-    stats_buckets  = (RequestStats **)calloc(STATS_BUCKET_COUNT, sizeof( RequestStats * )); 
+    CollectedStats *stats = (CollectedStats *)calloc(1, sizeof(CollectedStats));
+    if(stats == NULL) 
+      return NULL;
+    
+    stats->memoryExhausted = 0;
+    stats->hashTable  = (RequestStats **)calloc(STATS_BUCKET_COUNT, sizeof( RequestStats * )); 
     
     /* Iterate through heap and find all objects */
     (void)memset(&heapCallbacks, 0, sizeof(heapCallbacks));
     heapCallbacks.heap_iteration_callback = &cbObjectSpaceCounter;
-    error = (*jvmti)->IterateThroughHeap(jvmti, 0, NULL, &heapCallbacks, stats_buckets);
+    error = (*jvmti)->IterateThroughHeap(jvmti, 0, NULL, &heapCallbacks, stats);
     check_jvmti_error(jvmti, error, "Cannot iterate through heap");
     
-    return stats_buckets;
+    return stats;
 }
 
 
-static void freeStats(RequestStats **stats_buckets)
+static void freeStats(CollectedStats *collectedStats)
 {
   int i;
   
@@ -420,14 +507,15 @@ static void freeStats(RequestStats **stats_buckets)
     {
       RequestStats *stats;
       
-      stats = stats_buckets[i];
+      stats = collectedStats->hashTable[i];
       while(stats != NULL) {
         free(stats);
         stats = stats->next;
       }
     }
     
-    free(stats_buckets);
+    free(collectedStats->hashTable);
+    free(collectedStats);
 }
 
 
